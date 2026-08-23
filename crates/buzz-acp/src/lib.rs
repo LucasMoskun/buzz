@@ -209,6 +209,38 @@ enum SiblingCacheState {
     Unknown,
 }
 
+/// Resolve `--observer-readers` into unique parsed pubkeys.
+///
+/// The owner and the agent itself are dropped (the owner already receives the
+/// owner-scoped kind-24200 stream; a self-copy is meaningless). Entries that
+/// do not parse as hex pubkeys are warned about and skipped rather than
+/// failing startup — a fleet-wide config push must not brick an agent over
+/// one bad entry.
+fn resolve_observer_readers(
+    entries: &[String],
+    owner_pubkey_hex: &str,
+    agent_pubkey_hex: &str,
+) -> Vec<PublicKey> {
+    let mut seen = HashSet::new();
+    let mut readers = Vec::new();
+    for entry in entries {
+        if entry == owner_pubkey_hex || entry == agent_pubkey_hex {
+            continue;
+        }
+        match PublicKey::from_hex(entry) {
+            Ok(pubkey) => {
+                if seen.insert(pubkey) {
+                    readers.push(pubkey);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("ignoring invalid observer reader pubkey {entry:?}: {error}");
+            }
+        }
+    }
+    readers
+}
+
 /// Cache for the agent's owner pubkey.
 ///
 /// Owner is now provided via `--agent-owner` config flag (no REST lookup).
@@ -1376,6 +1408,7 @@ fn spawn_relay_observer_publisher(
     agent_pubkey_hex: String,
     owner_pubkey_hex: String,
     owner_pubkey: PublicKey,
+    observer_readers: Vec<PublicKey>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Subscribe BEFORE snapshotting so an event emitted between the two
@@ -1392,11 +1425,13 @@ fn spawn_relay_observer_publisher(
             agent_pubkey_hex,
             owner_pubkey_hex,
             owner_pubkey,
+            observer_readers,
         )
         .await;
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_relay_observer_publisher(
     snapshot: Vec<observer::ObserverEvent>,
     mut rx: tokio::sync::broadcast::Receiver<observer::ObserverEvent>,
@@ -1405,6 +1440,7 @@ async fn run_relay_observer_publisher(
     agent_pubkey_hex: String,
     owner_pubkey_hex: String,
     owner_pubkey: PublicKey,
+    observer_readers: Vec<PublicKey>,
 ) {
     let mut queue = ObserverPublishQueue::default();
     let max_snapshot_seq = snapshot.iter().map(|event| event.seq).max().unwrap_or(0);
@@ -1451,7 +1487,7 @@ async fn run_relay_observer_publisher(
                 if let Some(frame) = queue.next_frame() {
                     publish_relay_observer_event(
                         &publisher, &keys, &agent_pubkey_hex,
-                        &owner_pubkey_hex, &owner_pubkey, frame,
+                        &owner_pubkey_hex, &owner_pubkey, &observer_readers, frame,
                     ).await;
                 }
                 if closed && queue.is_empty() {
@@ -1795,6 +1831,7 @@ async fn publish_relay_observer_event(
     agent_pubkey_hex: &str,
     owner_pubkey_hex: &str,
     owner_pubkey: &PublicKey,
+    observer_readers: &[PublicKey],
     mut event: observer::ObserverEvent,
 ) {
     // Trim oversized frames to fit the plaintext cap rather than letting
@@ -1828,6 +1865,67 @@ async fn publish_relay_observer_event(
     };
     if let Err(error) = publisher.publish_event(signed).await {
         tracing::warn!("relay observer event dropped: {error}");
+    }
+
+    publish_shared_observer_copies(publisher, keys, agent_pubkey_hex, observer_readers, &event)
+        .await;
+}
+
+/// Publish one channel-scoped kind-24201 copy of a telemetry frame per
+/// authorized reader, each NIP-44 encrypted to that reader.
+///
+/// Frames without a parseable channel id are skipped entirely: the shared
+/// lane is channel-membership-gated at the relay, so a copy with no `h` tag
+/// has no delivery story. Reader copies ride the same pacer tick as the owner
+/// frame — the reader set is expected to stay small (a handful of observer
+/// devices), so the per-tick publish count is bounded at `1 + readers`.
+async fn publish_shared_observer_copies(
+    publisher: &RelayEventPublisher,
+    keys: &nostr::Keys,
+    agent_pubkey_hex: &str,
+    observer_readers: &[PublicKey],
+    event: &observer::ObserverEvent,
+) {
+    if observer_readers.is_empty() {
+        return;
+    }
+    let Some(channel_id) = event
+        .channel_id
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+    else {
+        return;
+    };
+    for reader in observer_readers {
+        let encrypted = match encrypt_observer_payload(keys, reader, event) {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                tracing::warn!("failed to encrypt shared observer copy: {error}");
+                continue;
+            }
+        };
+        let builder = match buzz_sdk::build_shared_agent_observer_frame(
+            channel_id,
+            &reader.to_hex(),
+            agent_pubkey_hex,
+            &encrypted,
+        ) {
+            Ok(builder) => builder,
+            Err(error) => {
+                tracing::warn!("failed to build shared observer copy: {error}");
+                continue;
+            }
+        };
+        let signed = match builder.sign_with_keys(keys) {
+            Ok(event) => event,
+            Err(error) => {
+                tracing::warn!("failed to sign shared observer copy: {error}");
+                continue;
+            }
+        };
+        if let Err(error) = publisher.publish_event(signed).await {
+            tracing::warn!("shared observer copy dropped: {error}");
+        }
     }
 }
 
@@ -2969,6 +3067,17 @@ async fn run_harness(
         {
             match PublicKey::from_hex(&owner_pubkey_hex) {
                 Ok(owner_pubkey) => {
+                    let observer_readers = resolve_observer_readers(
+                        &config.observer_readers,
+                        &owner_pubkey_hex,
+                        &pubkey_hex,
+                    );
+                    if !observer_readers.is_empty() {
+                        tracing::info!(
+                            readers = observer_readers.len(),
+                            "authorized observer readers enabled"
+                        );
+                    }
                     relay_observer_publisher = Some((
                         observer,
                         relay.event_publisher(),
@@ -2976,6 +3085,7 @@ async fn run_harness(
                         pubkey_hex.clone(),
                         owner_pubkey_hex,
                         owner_pubkey,
+                        observer_readers,
                     ));
                     relay
                         .subscribe_observer_controls()
@@ -3020,7 +3130,7 @@ async fn run_harness(
         }
     }
 
-    if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
+    if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner, readers)) =
         relay_observer_publisher.take()
     {
         relay_observer_publisher_task = Some(spawn_relay_observer_publisher(
@@ -3030,6 +3140,7 @@ async fn run_harness(
             agent_pubkey,
             owner_pubkey,
             owner,
+            readers,
         ));
     }
 
@@ -9101,6 +9212,7 @@ mod observer_snapshot_race_tests {
             agent_keys.public_key().to_hex(),
             owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            Vec::new(),
         )
         .await;
 
@@ -9126,6 +9238,109 @@ mod observer_snapshot_race_tests {
             markers,
             ["before", "overlap", "after"],
             "each event must be published exactly once, in order"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observer_reader_tests {
+    use super::*;
+    use nostr::Keys;
+
+    #[test]
+    fn resolve_observer_readers_drops_owner_self_dupes_and_garbage() {
+        let owner = Keys::generate().public_key().to_hex();
+        let agent = Keys::generate().public_key().to_hex();
+        let reader = Keys::generate().public_key().to_hex();
+        let entries = vec![
+            owner.clone(),
+            agent.clone(),
+            reader.clone(),
+            reader.clone(),
+            "not-a-pubkey".to_string(),
+        ];
+        let resolved = resolve_observer_readers(&entries, &owner, &agent);
+        assert_eq!(resolved.len(), 1, "only the unique valid reader survives");
+        assert_eq!(resolved[0].to_hex(), reader);
+    }
+
+    /// A channel-scoped frame is published once to the owner (kind 24200) and
+    /// once per authorized reader (kind 24201, `h`-tagged, decryptable only by
+    /// that reader). A channel-less frame gets no reader copies — the shared
+    /// lane is channel-membership-gated at the relay.
+    #[tokio::test(start_paused = true)]
+    async fn reader_copies_published_for_channel_frames_only() {
+        let observer = observer::ObserverHandle::in_process();
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let reader_keys = Keys::generate();
+        let (publisher, mut published_rx) = RelayEventPublisher::test_pair();
+
+        let channel = uuid::Uuid::new_v4();
+        observer.emit(
+            "channel_event",
+            None,
+            &observer::context_for(Some(channel), None, None),
+            serde_json::json!({ "marker": "in-channel" }),
+        );
+        observer.emit(
+            "channelless_event",
+            None,
+            &observer::context_for(None, None, None),
+            serde_json::json!({ "marker": "no-channel" }),
+        );
+        let rx = observer.subscribe();
+        let snapshot = observer.snapshot();
+        drop(observer);
+
+        run_relay_observer_publisher(
+            snapshot,
+            rx,
+            publisher,
+            agent_keys.clone(),
+            agent_keys.public_key().to_hex(),
+            owner_keys.public_key().to_hex(),
+            owner_keys.public_key(),
+            vec![reader_keys.public_key()],
+        )
+        .await;
+
+        let mut owner_frames = 0usize;
+        let mut reader_frames = 0usize;
+        while let Some(event) = published_rx.recv().await {
+            match event.kind.as_u16() as u32 {
+                buzz_core::kind::KIND_AGENT_OBSERVER_FRAME => {
+                    decrypt_observer_payload::<serde_json::Value>(&owner_keys, &event)
+                        .expect("owner decrypts owner frame");
+                    owner_frames += 1;
+                }
+                buzz_core::kind::KIND_AGENT_OBSERVER_SHARED_FRAME => {
+                    let payload: serde_json::Value = decrypt_observer_payload(&reader_keys, &event)
+                        .expect("reader decrypts shared copy");
+                    assert_eq!(
+                        payload["payload"]["marker"], "in-channel",
+                        "only the channel-scoped frame gets a reader copy"
+                    );
+                    assert!(
+                        event.tags.iter().any(|t| {
+                            t.kind().to_string() == "h"
+                                && t.content().is_some_and(|c| c == channel.to_string())
+                        }),
+                        "shared copy must carry the channel h tag"
+                    );
+                    assert!(
+                        decrypt_observer_payload::<serde_json::Value>(&owner_keys, &event).is_err(),
+                        "owner keys must not decrypt a reader-scoped copy"
+                    );
+                    reader_frames += 1;
+                }
+                other => panic!("unexpected published kind {other}"),
+            }
+        }
+        assert_eq!(owner_frames, 2, "both frames reach the owner stream");
+        assert_eq!(
+            reader_frames, 1,
+            "exactly one reader copy, channel frame only"
         );
     }
 }
@@ -9825,6 +10040,7 @@ mod observer_publish_cadence_tests {
             agent_keys.public_key().to_hex(),
             owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            Vec::new(),
         ));
 
         // t=0: nothing may publish, no matter how full the snapshot was.
@@ -9904,6 +10120,7 @@ mod observer_publish_cadence_tests {
             agent_keys.public_key().to_hex(),
             owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            Vec::new(),
         ));
 
         settle().await;
@@ -9970,6 +10187,7 @@ mod observer_publish_cadence_tests {
             agent_keys.public_key().to_hex(),
             owner_keys.public_key().to_hex(),
             owner_keys.public_key(),
+            Vec::new(),
         ));
         settle().await;
 
@@ -10145,6 +10363,7 @@ mod build_mcp_servers_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             public_status: false,
+            observer_readers: vec![],
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
@@ -11243,6 +11462,7 @@ mod error_outcome_emission_tests {
             has_generated_codex_config: false,
             relay_observer: false,
             public_status: false,
+            observer_readers: vec![],
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             idle_pool_sleep_secs: 0,
