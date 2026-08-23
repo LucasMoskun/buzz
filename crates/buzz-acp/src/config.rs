@@ -473,6 +473,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_PUBLIC_STATUS", default_value_t = false)]
     pub public_status: bool,
 
+    /// Comma-separated hex pubkeys of authorized non-owner readers. Each
+    /// channel-scoped observer telemetry frame is additionally published as a
+    /// kind-24201 copy per reader, NIP-44 encrypted to that reader. Requires
+    /// `--relay-observer`. The owner and the agent itself are skipped (the
+    /// owner already receives the kind-24200 stream).
+    #[arg(long, env = "BUZZ_ACP_OBSERVER_READERS", value_delimiter = ',')]
+    pub observer_readers: Vec<String>,
+
     /// Exit after this many seconds with no dispatched events and no turn in flight.
     /// 0 disables inactivity self-termination.
     #[arg(long, env = "BUZZ_ACP_EXIT_AFTER_INACTIVITY", default_value_t = 0)]
@@ -556,6 +564,9 @@ pub struct Config {
     pub relay_observer: bool,
     /// Whether to publish channel-visible redacted work status (kind 30315).
     pub public_status: bool,
+    /// Authorized non-owner reader pubkeys (hex) for kind-24201 observer
+    /// frame copies. Normalized to lowercase; validated at startup.
+    pub observer_readers: Vec<String>,
     /// Seconds without dispatched events before an idle harness exits. 0 = disabled.
     pub exit_after_inactivity_secs: u64,
     /// Whether ACP/LLM subprocess initialization is deferred until accepted work arrives.
@@ -1107,6 +1118,12 @@ impl Config {
             has_generated_codex_config,
             relay_observer: args.relay_observer,
             public_status: args.public_status,
+            observer_readers: args
+                .observer_readers
+                .iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
             exit_after_inactivity_secs: args.exit_after_inactivity,
             lazy_pool: args.lazy_pool,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
@@ -1479,6 +1496,7 @@ mod tests {
             has_generated_codex_config: false,
             relay_observer: false,
             public_status: false,
+            observer_readers: Vec::new(),
             exit_after_inactivity_secs: 0,
             lazy_pool: false,
             agent_owner: None,

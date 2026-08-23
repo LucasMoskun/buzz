@@ -5,14 +5,15 @@
 
 use buzz_core::{
     kind::{
-        KIND_AGENT_OBSERVER_FRAME, KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_DELETION,
-        KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET, KIND_GIT_ISSUE, KIND_GIT_PATCH,
-        KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT,
-        KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED,
-        KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
-        KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
-        KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_AGENT_OBSERVER_FRAME, KIND_AGENT_OBSERVER_SHARED_FRAME, KIND_APPROVAL_DENY,
+        KIND_APPROVAL_GRANT, KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_OPEN, KIND_EMOJI_SET,
+        KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+        KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
+        KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST,
+        KIND_IA_UNARCHIVE_REQUEST, KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT,
+        KIND_MODERATION_TIMEOUT, KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT,
+        KIND_PRESENCE_UPDATE, KIND_PROJECT, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
+        KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -276,6 +277,41 @@ pub fn build_agent_observer_frame(
 
     Ok(EventBuilder::new(
         Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
+        encrypted_content,
+    )
+    .tags(tags))
+}
+
+/// Build a channel-scoped encrypted observer frame copy for an authorized
+/// non-owner reader (kind 24201).
+///
+/// Unlike [`build_agent_observer_frame`], these frames carry an `h` tag and
+/// ride the relay's generic ephemeral channel routing: publication and
+/// delivery are both gated by membership of `channel_id`, and the content is
+/// NIP-44 encrypted to the single reader in the cleartext `p` tag.
+pub fn build_shared_agent_observer_frame(
+    channel_id: Uuid,
+    reader_pubkey: &str,
+    agent_pubkey: &str,
+    encrypted_content: &str,
+) -> Result<EventBuilder, SdkError> {
+    if !content_looks_like_nip44(encrypted_content) {
+        return Err(SdkError::InvalidInput(
+            "observer frame content must be NIP-44 v2 ciphertext".into(),
+        ));
+    }
+
+    let reader_pubkey = check_pubkey_hex(reader_pubkey, "reader_pubkey")?;
+    let agent_pubkey = check_pubkey_hex(agent_pubkey, "agent_pubkey")?;
+    let tags = vec![
+        tag(&["h", &channel_id.to_string()])?,
+        tag(&["p", &reader_pubkey])?,
+        tag(&[OBSERVER_AGENT_TAG, &agent_pubkey])?,
+        tag(&[OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY])?,
+    ];
+
+    Ok(EventBuilder::new(
+        Kind::Custom(KIND_AGENT_OBSERVER_SHARED_FRAME as u16),
         encrypted_content,
     )
     .tags(tags))
@@ -2344,6 +2380,52 @@ mod tests {
             &"a".repeat(64),
             &"b".repeat(64),
             OBSERVER_FRAME_TELEMETRY,
+            "not encrypted",
+        )
+        .unwrap_err();
+        assert!(matches!(err, SdkError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn shared_agent_observer_frame_happy_path() {
+        let sender = keys();
+        let reader = keys();
+        let agent = keys();
+        let cid = uuid();
+        let encrypted = buzz_core::observer::encrypt_observer_payload(
+            &sender,
+            &reader.public_key(),
+            &serde_json::json!({"type": "acp_read"}),
+        )
+        .unwrap();
+        let ev = sign(
+            build_shared_agent_observer_frame(
+                cid,
+                &reader.public_key().to_hex(),
+                &agent.public_key().to_hex(),
+                &encrypted,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(ev.kind.as_u16(), KIND_AGENT_OBSERVER_SHARED_FRAME as u16);
+        assert_eq!(ev.content, encrypted);
+        assert!(has_tag(&ev, "h", &cid.to_string()));
+        assert!(has_tag(&ev, "p", &reader.public_key().to_hex()));
+        assert!(has_tag(
+            &ev,
+            OBSERVER_AGENT_TAG,
+            &agent.public_key().to_hex()
+        ));
+        assert!(has_tag(&ev, OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY));
+    }
+
+    #[test]
+    fn shared_agent_observer_frame_rejects_plaintext_content() {
+        let err = build_shared_agent_observer_frame(
+            uuid(),
+            &"a".repeat(64),
+            &"b".repeat(64),
             "not encrypted",
         )
         .unwrap_err();

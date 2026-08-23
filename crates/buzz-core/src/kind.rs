@@ -467,6 +467,11 @@ pub const KIND_PAIRING: u32 = 24134;
 pub const KIND_TYPING_INDICATOR: u32 = 20002;
 /// Ephemeral: owner-scoped encrypted agent observer telemetry and control frame.
 pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
+/// Ephemeral: channel-scoped encrypted observer telemetry copy for an
+/// authorized non-owner reader. Carries an `h` tag and rides the generic
+/// ephemeral channel fan-out (membership-gated, never stored); content is
+/// NIP-44 encrypted to the single reader in the cleartext `p` tag.
+pub const KIND_AGENT_OBSERVER_SHARED_FRAME: u32 = 24201;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
 /// huddle channel with an `h` tag; never stored in the timeline.
 pub const KIND_HUDDLE_REACTION: u32 = 24810;
@@ -698,6 +703,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,
     KIND_AGENT_OBSERVER_FRAME,
+    KIND_AGENT_OBSERVER_SHARED_FRAME,
     KIND_HTTP_AUTH,
     KIND_STREAM_MESSAGE,
     KIND_STREAM_MESSAGE_V2,
